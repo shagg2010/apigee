@@ -26,9 +26,7 @@ public class ThreadPoolWithJobAffinityExecutor implements
 	private final int jobQueueSize; 
 	private final static int DEFAULT_JOB_QUEUE_SIZE=10;
 	private final static int DEFAULT_THREAD_POOL_SIZE=10;
-	private final static long DEFAULT_JOB_QUEUE_ADDITION_TIMEOUT=100; // 500 milliseconds
 	private final Lock lock = new ReentrantLock();
-	private final long jobQueueTimeout;
 	
 	/**
 	 * Create a new ThreadPoolWithJobAffinity thread pool of queue length of default poolSize
@@ -37,18 +35,18 @@ public class ThreadPoolWithJobAffinityExecutor implements
 	 *  DEFAULT_JOB_QUEUE_ADDITION_TIMEOUT = 100 milliseconds
 	 */
 	public ThreadPoolWithJobAffinityExecutor(){
-		this(DEFAULT_THREAD_POOL_SIZE,DEFAULT_JOB_QUEUE_SIZE, DEFAULT_JOB_QUEUE_ADDITION_TIMEOUT);
+		this(DEFAULT_THREAD_POOL_SIZE,DEFAULT_JOB_QUEUE_SIZE);
 	}
 	/**
 	 * Create a new ThreadPoolWithJobAffinity thread pool of specified poolSize where every workerThread will have its own pool
 	 * @param poolSize number of workerThreads ready for accepting the jobs
 	 * @param jobQueueSize the core size of number of jobs that can be queued for the workerThread which executes the jobs of a given jobId
+	 * 
 	 */
-	public ThreadPoolWithJobAffinityExecutor(int poolSize, int jobQueueSize,long jobQueueTimeout){
+	public ThreadPoolWithJobAffinityExecutor(int poolSize, int jobQueueSize){
 		this.shutdown=false;
 		this.poolSize=poolSize;
 		this.jobQueueSize=jobQueueSize;
-		this.jobQueueTimeout=jobQueueTimeout;
 		this.jobs=new ConcurrentHashMap<>(poolSize);
 	}
 
@@ -58,6 +56,8 @@ public class ThreadPoolWithJobAffinityExecutor implements
 	}
 	
 	public int totalRunningJobs(){
+		if(shutdown)
+			return 0;
 		return this.jobs.size();
 	}
 
@@ -87,7 +87,7 @@ public class ThreadPoolWithJobAffinityExecutor implements
 				finally{
 					lock.unlock();
 				}
-				workerThread = new Worker(jobId,UUID.randomUUID().toString(),this.jobQueueSize,this.jobQueueTimeout);
+				workerThread = new Worker(jobId,UUID.randomUUID().toString(),this.jobQueueSize);
 				workerThread.setUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
 					public void uncaughtException(Thread myT, Throwable e) {
 						System.out.println(myT.getName() + " throws exception: " + e);
@@ -103,6 +103,9 @@ public class ThreadPoolWithJobAffinityExecutor implements
 		}
 	}
 	
+	/**
+	 * Removes the mostIdle thread (at given moment) from the workerThread pool of specific jobId
+	 */
 	private void shutdownIdleWorkerThread(){
 		try{
 			if(!shutdown){
@@ -122,7 +125,8 @@ public class ThreadPoolWithJobAffinityExecutor implements
 						removed=true;
 						mostIdle.shutdownWorker();
 						mostIdle.join();
-						System.out.println("POOL_REMVOE_IDLE||WorkerThread: " + mostIdle.getCurrentWorkerThreadId() + " with jobId: " + mostIdle.wJobId + " is now removed!");
+						mostIdle.interrupt();
+						//System.out.println("POOL_REMVOE_IDLE||WorkerThread: " + mostIdle.getCurrentWorkerThreadId() + " with jobId: " + mostIdle.wJobId + " is now removed!");
 						jobs.remove(mostIdle.wJobId);
 						break;
 					}
@@ -137,7 +141,7 @@ public class ThreadPoolWithJobAffinityExecutor implements
 	 */
 	@Override
 	public void shutdown() {
-		System.out.println("THREAD_POOL_SHUTDOWN|| Threadpool shutdown already initiated!");
+		//System.out.println("THREAD_POOL_SHUTDOWN|| Threadpool shutdown initiated!");
 		if(shutdown==true)
 			//System.out.println("Threadpool shutdown already initiated!");
 			throw new IllegalStateException("Threadpool shutdown already initiated!");
@@ -158,13 +162,18 @@ public class ThreadPoolWithJobAffinityExecutor implements
 				w.shutdownWorker();
 				w.join();
 				w.interrupt();
-				
 			}
 		}
 		catch(InterruptedException e){}
 		finally{
 			shutdown=true;
 		}
+	}
+	
+	public boolean isRunning(){
+		if(shutdown) 
+			return false;
+		return true;
 	}
 	
 	/**
@@ -184,65 +193,58 @@ public class ThreadPoolWithJobAffinityExecutor implements
 		private final Condition isEmptyCondition;
 		private final Condition shutdownCondition;
 		private final Lock lock;
-		private final long timeout;
 		
-		public Worker(String jobId,String tid,int poolSize, long timeout){
+		public Worker(String jobId,String tid,int poolSize){
 			this.wJobId=jobId;
 			this.threadPool=new LinkedBlockingQueue<>(poolSize);
 			this.tid=tid;
 			this.lock=new ReentrantLock();
 			this.isEmptyCondition = this.lock.newCondition();
 			this.shutdownCondition = this.lock.newCondition();
-			this.timeout=timeout;
-			System.out.println("POOL_ADD_NEW|| No workerThread is currently executing jobs with id: " + jobId + ", adding " + this.getCurrentWorkerThreadId());
+			//System.out.println("POOL_ADD_NEW|| No workerThread is currently executing jobs with id: " + jobId + ", adding " + this.getCurrentWorkerThreadId());
 			start();
 		}
 		
 		@Override
 		public void run() {
-			try{
-				//System.out.println("WorkerThread: " + getCurrentWorkerThreadId() + " looking jobs with id: " + this.wJobId);
-				while (isActive||drainQueue) {
-					try {
-						lock.lock();
-						//System.out.println("WorkerThread: "	+ getCurrentWorkerThreadId() + " looping for jobs for jobId: " + this.wJobId);
-						if(!isActive&&drainQueue&&this.threadPool.size()==0){
-							drainQueue=false;
-							shutdownCondition.signalAll();
+			//System.out.println("WorkerThread: " + getCurrentWorkerThreadId() + " looking jobs with id: " + this.wJobId);
+			while (isActive||drainQueue) {
+				try{
+					lock.lock();
+					//System.out.println("WorkerThread: "	+ getCurrentWorkerThreadId() + " looping for jobs for jobId: " + this.wJobId);
+					if (this.threadPool != null && this.threadPool.size()>0) {
+						//System.out.println("J-Removing|| WorkerThread: " + getCurrentWorkerThreadId() + " on Job queue: " + this.wJobId);
+						Runnable job = this.threadPool.poll();
+						if(job!=null){
+							Thread task = new Thread(job);
+							task.start();
 						}
-						if (this.threadPool.size()==0 && isActive && !drainQueue) {
-							isEmptyCondition.await();
-						}
-						if (this.threadPool != null && this.threadPool.size()>0) {
-							//System.out.println("J-Removing|| WorkerThread: " + getCurrentWorkerThreadId() + " on Job queue: " + this.wJobId);
-							Runnable job = this.threadPool.poll();
-							if(job!=null){
-								Thread task = new Thread(job);
-								task.start();
-							}
-						}
-					} catch (InterruptedException e) {
-						e.printStackTrace();
-					} finally {
-						lock.unlock();
 					}
-					//System.out.println("WorkerThread: " + getCurrentWorkerThreadId() + " executing jobs with id: " + this.wJobId + " is shutting down!");
+					if(this.threadPool.size()==0&&drainQueue){
+						shutdownCondition.signalAll();
+						break;
+					}
+					if (!drainQueue&&this.threadPool.size()==0) {
+						isEmptyCondition.await();
+					}
 				}
+				catch(InterruptedException e){}
+				finally{
+					lock.unlock();
+				}
+				//System.out.println("WorkerThread: " + getCurrentWorkerThreadId() + " executing jobs with id: " + this.wJobId + " is shutting down!");
 			}
-			catch(Exception e){
-				e.printStackTrace();
-			}
+			
 		}
 		
 		public void addJobsToQueue(Runnable job){
-			if (isActive) {
+			if (isActive&&!drainQueue) {
 				try {
 					lock.lock();
 					//System.out.println("J-Adding|| WorkerThread: " + getCurrentWorkerThreadId() + " gets new on Job queue: " + this.wJobId);
-					this.threadPool.offer(job, timeout, TimeUnit.MILLISECONDS);
+					this.threadPool.add(job);
 					isEmptyCondition.signalAll();
-				} catch (InterruptedException e) {
-				}
+				} 
 				finally{
 					lock.unlock();
 				}
@@ -279,5 +281,4 @@ public class ThreadPoolWithJobAffinityExecutor implements
 		}
 		
 	}
-
 }
